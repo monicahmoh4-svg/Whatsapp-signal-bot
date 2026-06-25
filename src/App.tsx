@@ -140,11 +140,18 @@ export default function App() {
     if (!config.apiToken || !config.groupId) {
       return { success: false, error: "No WhatsApp group connected. Go to Settings to connect." };
     }
+    // Ensure @g.us suffix — required by Whapi for group messages
+    const cleanGroupId = (() => {
+      const id = config.groupId.trim();
+      if (id.endsWith("@g.us")) return id;
+      if (id.includes("@")) return id.split("@")[0] + "@g.us";
+      return id + "@g.us";
+    })();
     try {
       const res = await fetch("/api/whatsapp/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiToken: config.apiToken, groupId: config.groupId, text }),
+        body: JSON.stringify({ apiToken: config.apiToken, groupId: cleanGroupId, text }),
       });
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data.error || "Send failed");
