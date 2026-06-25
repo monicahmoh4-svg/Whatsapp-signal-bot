@@ -10,6 +10,14 @@ interface Props {
   onSetActive: (g: ConnectedGroup) => void;
 }
 
+function sanitizeGroupId(id: string): string {
+  const clean = id.trim().replace(/\s+/g, "");
+  if (!clean) return clean;
+  if (clean.endsWith("@g.us")) return clean;
+  if (clean.includes("@")) return clean.split("@")[0] + "@g.us";
+  return clean + "@g.us";
+}
+
 function maskToken(t: string) {
   if (!t || t.length < 10) return "•••••";
   return t.slice(0, 8) + "••••" + t.slice(-4);
@@ -55,7 +63,7 @@ export default function GroupsView({ groups, activeConfig, onGroupsChange, onSet
       const newGroup: ConnectedGroup = {
         id: `grp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         apiToken: token.trim(),
-        groupId: groupId.trim(),
+        groupId: sanitizeGroupId(groupId),
         groupName: groupName.trim() || data.groupName || groupId.trim(),
         isActive: groups.length === 0,
         connectedAt: new Date().toISOString(),
@@ -80,7 +88,7 @@ export default function GroupsView({ groups, activeConfig, onGroupsChange, onSet
     try {
       const res  = await fetch("/api/whatsapp/test", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiToken: g.apiToken, groupId: g.groupId, groupName: g.groupName }),
+        body: JSON.stringify({ apiToken: g.apiToken, groupId: sanitizeGroupId(g.groupId), groupName: g.groupName }),
       });
       const data = await res.json();
       const ok   = res.ok && data.success;
@@ -139,7 +147,7 @@ export default function GroupsView({ groups, activeConfig, onGroupsChange, onSet
             </div>
             <div className="space-y-1.5">
               <label className="text-[10px] text-slate-400 font-medium">WhatsApp Group ID</label>
-              <input value={groupId} onChange={e => setGroupId(e.target.value)} placeholder="e.g. 120363XXXXXXXXXX@g.us"
+              <input value={groupId} onChange={e => setGroupId(e.target.value)} onBlur={e => setGroupId(sanitizeGroupId(e.target.value))} placeholder="e.g. 120363XXXXXXXXXX@g.us"
                 className="w-full px-3 py-2 text-xs bg-slate-900 border border-slate-800 focus:border-emerald-500 rounded-xl text-slate-100 placeholder-slate-600 outline-none font-mono" />
               <p className="text-[10px] text-slate-500">Find your group ID in the Whapi.Cloud dashboard → Groups</p>
             </div>
