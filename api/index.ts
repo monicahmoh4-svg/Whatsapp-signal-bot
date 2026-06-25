@@ -27,22 +27,38 @@ async function whapiRequest(
   const apiToken = token || process.env.WHAPI_TOKEN;
   if (!apiToken) throw new Error("WHAPI_TOKEN is not set. Add it to Vercel environment variables.");
 
+  // Do NOT send Content-Type or body on GET/DELETE requests — Whapi rejects them
+  // with "wrong request parameters" if extra headers/body are included on GET
+  const isBodyMethod = method === "POST" || method === "PUT";
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiToken}`,
+    Accept: "application/json",
+  };
+  if (isBodyMethod && body) {
+    headers["Content-Type"] = "application/json";
+  }
+
   const res = await fetch(`${WHAPI_BASE}${endpoint}`, {
     method,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiToken}`,
-    },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+    headers,
+    ...(isBodyMethod && body ? { body: JSON.stringify(body) } : {}),
   });
 
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("application/json")) {
     const txt = await res.text().catch(() => "(unreadable)");
-    throw new Error(`Whapi returned non-JSON (HTTP ${res.status}). Preview: ${txt.substring(0, 200)}`);
+    throw new Error(`Whapi returned non-JSON (HTTP ${res.status}). Body: ${txt.substring(0, 300)}`);
   }
 
-  return res.json();
+  const data = await res.json();
+
+  // Surface Whapi error messages clearly
+  if (!res.ok) {
+    const errMsg = data?.error?.message || data?.error || data?.message || `HTTP ${res.status}`;
+    throw new Error(typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg));
+  }
+
+  return data;
 }
 
 // ─── Group ID sanitizer ──────────────────────────────────────────────────────
@@ -146,17 +162,21 @@ app.post("/api/login", (req, res) => {
 app.post("/api/whatsapp/groups", async (req, res) => {
   const { apiToken } = req.body;
   try {
-    const data = await whapiRequest("/groups?count=100&offset=0", "GET", undefined, apiToken);
-    // Whapi returns groups array; each group has id, subject (name), size (member count)
-    const rawGroups = data.groups || data.items || [];
+    // GET /groups — no body, no Content-Type header (fixed in whapiRequest)
+    // Query params: count=100 to get up to 100 groups
+    const data = await whapiRequest("/groups?count=100", "GET", undefined, apiToken);
+
+    // Whapi response: { groups: [ { id, subject, size, is_admin, ... } ] }
+    const rawGroups = Array.isArray(data) ? data : (data.groups || data.items || []);
     const groups = rawGroups.map((g: any) => ({
-      id: g.id,                                         // e.g. 120363XXXXXXXXXX@g.us
-      name: g.subject || g.name || g.id,               // Whapi uses "subject" for group name
+      id: g.id,                                          // e.g. 120363XXXXXXXXXX@g.us
+      name: g.subject || g.name || g.id,                // Whapi uses "subject" for group name
       participants: g.size || g.participants_count || 0,
-      isAdmin: g.is_admin || false,
+      isAdmin: g.is_admin || g.isAdmin || false,
     }));
     res.json({ success: true, groups });
   } catch (err: any) {
+    console.error("[WhatsApp/groups]", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -169,12 +189,13 @@ app.post("/api/whatsapp/verify", async (req, res) => {
     return;
   }
   try {
-    const data = await whapiRequest("/settings", "GET", undefined, apiToken);
+    // /health returns channel status without requiring specific plan features
+    const data = await whapiRequest("/health", "GET", undefined, apiToken);
     res.json({
       success: true,
-      phone: data.me?.phone || data.phone || "Unknown",
-      name: data.me?.name || data.name || "WhatsApp Account",
-      status: data.status || "connected",
+      phone: data.account_info?.phone || data.phone || "Connected",
+      name: data.account_info?.name || data.name || "WhatsApp Account",
+      status: data.status?.status || data.status || "ok",
     });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
