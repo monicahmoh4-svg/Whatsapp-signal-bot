@@ -45,6 +45,20 @@ async function whapiRequest(
   return res.json();
 }
 
+// ─── Group ID sanitizer ──────────────────────────────────────────────────────
+// Whapi requires group IDs to end with @g.us — e.g. 120363XXXXXXXXXX@g.us
+// Without this suffix the message is sent to nowhere and appears to succeed.
+function sanitizeGroupId(groupId: string): string {
+  if (!groupId) return groupId;
+  const clean = groupId.trim().replace(/\s+/g, "");
+  // Already has the correct suffix
+  if (clean.endsWith("@g.us")) return clean;
+  // Has a different suffix — replace it
+  if (clean.includes("@")) return clean.split("@")[0] + "@g.us";
+  // Plain numeric ID — add the suffix
+  return clean + "@g.us";
+}
+
 // ─── Signal formatting helpers ────────────────────────────────────────────────
 // WhatsApp uses *bold*, _italic_, ~strikethrough~, ```code``` for formatting
 function formatSignalForWhatsApp(params: {
@@ -132,11 +146,13 @@ app.post("/api/login", (req, res) => {
 app.post("/api/whatsapp/groups", async (req, res) => {
   const { apiToken } = req.body;
   try {
-    const data = await whapiRequest("/groups?count=100", "GET", undefined, apiToken);
-    const groups = (data.groups || []).map((g: any) => ({
-      id: g.id,
-      name: g.name || g.subject || g.id,
-      participants: g.participants_count || g.size || 0,
+    const data = await whapiRequest("/groups?count=100&offset=0", "GET", undefined, apiToken);
+    // Whapi returns groups array; each group has id, subject (name), size (member count)
+    const rawGroups = data.groups || data.items || [];
+    const groups = rawGroups.map((g: any) => ({
+      id: g.id,                                         // e.g. 120363XXXXXXXXXX@g.us
+      name: g.subject || g.name || g.id,               // Whapi uses "subject" for group name
+      participants: g.size || g.participants_count || 0,
       isAdmin: g.is_admin || false,
     }));
     res.json({ success: true, groups });
@@ -173,18 +189,32 @@ app.post("/api/whatsapp/send", async (req, res) => {
     return;
   }
 
+  // CRITICAL: ensure the group ID has the @g.us suffix Whapi requires
+  const cleanGroupId = sanitizeGroupId(groupId);
+
   try {
     const data = await whapiRequest("/messages/text", "POST", {
-      to: groupId,
+      to: cleanGroupId,
       body: text,
     }, apiToken);
 
-    if (!data.sent && !data.message?.id) {
-      throw new Error(data.message || data.error?.message || "Send failed");
+    // Whapi returns { sent: true, message: { id: "..." } } on success
+    // or { error: { message: "..." } } / { message: "error text" } on failure
+    if (data.error) {
+      throw new Error(
+        typeof data.error === "string" ? data.error :
+        data.error?.message || data.error?.text || JSON.stringify(data.error)
+      );
+    }
+    if (!data.sent && !data.message?.id && !data.id) {
+      throw new Error(
+        typeof data.message === "string" ? data.message : "Message not sent — check your group ID and API token"
+      );
     }
 
     res.json({ success: true, messageId: data.message?.id || data.id || "sent" });
   } catch (err: any) {
+    console.error("[WhatsApp/send]", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -207,16 +237,26 @@ app.post("/api/whatsapp/test", async (req, res) => {
       `🔗 Link: ${promoUrl || ""}\n\n` +
       `⏰ _Verified: ${new Date().toUTCString()}_`;
 
+    const cleanGroupId = sanitizeGroupId(groupId);
     const data = await whapiRequest("/messages/text", "POST", {
-      to: groupId,
+      to: cleanGroupId,
       body: text,
     }, apiToken);
 
-    if (!data.sent && !data.message?.id) {
-      throw new Error(data.message || data.error?.message || "Test send failed");
+    if (data.error) {
+      throw new Error(
+        typeof data.error === "string" ? data.error :
+        data.error?.message || data.error?.text || JSON.stringify(data.error)
+      );
+    }
+    if (!data.sent && !data.message?.id && !data.id) {
+      throw new Error(
+        typeof data.message === "string" ? data.message :
+        `Message not delivered. Group ID used: ${cleanGroupId}. Make sure the ID ends with @g.us and your number is a member of the group.`
+      );
     }
 
-    res.json({ success: true, messageId: data.message?.id || "sent", groupName: groupName || groupId });
+    res.json({ success: true, messageId: data.message?.id || data.id || "sent", groupName: groupName || groupId });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -408,8 +448,10 @@ app.post("/api/cron/auto-broadcast", async (req, res) => {
       });
     }
 
-    const data = await whapiRequest("/messages/text", "POST", { to: groupId, body: text }, apiToken);
-    if (!data.sent && !data.message?.id) throw new Error(data.message || "Send failed");
+    const cleanGroupId = sanitizeGroupId(groupId);
+    const data = await whapiRequest("/messages/text", "POST", { to: cleanGroupId, body: text }, apiToken);
+    if (data.error) throw new Error(typeof data.error === "string" ? data.error : data.error?.message || JSON.stringify(data.error));
+    if (!data.sent && !data.message?.id && !data.id) throw new Error(typeof data.message === "string" ? data.message : "Send failed — check group ID and token");
 
     lastCronRunAt = new Date().toISOString();
     cronTotalSent += 1;
