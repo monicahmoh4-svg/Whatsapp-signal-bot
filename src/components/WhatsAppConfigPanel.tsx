@@ -5,6 +5,15 @@ import { AnimatePresence, motion } from "motion/react";
 
 interface Props { config: WhatsAppConfig; onChange: (c: WhatsAppConfig) => void; }
 
+// Ensure group ID always has @g.us suffix required by Whapi
+function sanitizeGroupId(id: string): string {
+  const clean = id.trim().replace(/\s+/g, "");
+  if (!clean) return clean;
+  if (clean.endsWith("@g.us")) return clean;
+  if (clean.includes("@")) return clean.split("@")[0] + "@g.us";
+  return clean + "@g.us";
+}
+
 interface Group { id: string; name: string; participants: number; isAdmin: boolean; }
 
 export default function WhatsAppConfigPanel({ config, onChange }: Props) {
@@ -36,7 +45,7 @@ export default function WhatsAppConfigPanel({ config, onChange }: Props) {
   };
 
   const handleSelectGroup = (g: Group) => {
-    onChange({ ...config, groupId: g.id, groupName: g.name });
+    onChange({ ...config, groupId: sanitizeGroupId(g.id), groupName: g.name });
     setShowGroupPicker(false);
   };
 
@@ -48,9 +57,10 @@ export default function WhatsAppConfigPanel({ config, onChange }: Props) {
     }
     setTestStatus("testing"); setErrorMsg(""); setSuccessMsg("");
     try {
+      const cleanId = sanitizeGroupId(config.groupId);
       const res = await fetch("/api/whatsapp/test", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ apiToken: config.apiToken, groupId: config.groupId, groupName: config.groupName }),
+        body: JSON.stringify({ apiToken: config.apiToken, groupId: cleanId, groupName: config.groupName }),
       });
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data.error || "Test failed");
@@ -111,6 +121,7 @@ export default function WhatsAppConfigPanel({ config, onChange }: Props) {
             <input
               type="text" value={config.groupName || config.groupId}
               onChange={e => onChange({ ...config, groupId: e.target.value, groupName: e.target.value })}
+              onBlur={e => { const s = sanitizeGroupId(e.target.value); if (s !== e.target.value) onChange({ ...config, groupId: s, groupName: s }); }}
               placeholder="Select a group or paste group ID"
               className="flex-1 px-3 py-2.5 text-xs bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-xl text-slate-100 placeholder-slate-600 outline-none font-mono"
               readOnly={!!config.groupName && config.groupId !== config.groupName}
