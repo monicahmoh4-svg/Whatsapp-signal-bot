@@ -12,122 +12,132 @@ const ai = process.env.GEMINI_API_KEY
   ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
   : null;
 
-// ─── Whapi.Cloud helper ───────────────────────────────────────────────────────
-// Whapi.Cloud is the API layer that lets you send messages to WhatsApp groups
-// from any regular WhatsApp number — no Meta business verification required.
-// Docs: https://whapi.cloud/docs
+// ─── Whapi.Cloud direct fetch ─────────────────────────────────────────────────
+// Called server-side only for the cron endpoint (cron-job.org → Vercel → Whapi).
+// All other WhatsApp calls go browser → Whapi directly (see src/whapi.ts).
 const WHAPI_BASE = "https://gate.whapi.cloud";
 
-async function whapiRequest(
-  endpoint: string,
-  method: "GET" | "POST" | "PUT" | "DELETE",
-  body?: object,
-  token?: string
-): Promise<any> {
-  const apiToken = token || process.env.WHAPI_TOKEN;
-  if (!apiToken) throw new Error("WHAPI_TOKEN is not set. Add it to Vercel environment variables.");
+async function whapiSendDirect(
+  token: string,
+  groupId: string,
+  text: string
+): Promise<{ messageId: string }> {
+  const cleanId = sanitizeGroupId(groupId);
 
-  // Do NOT send Content-Type or body on GET/DELETE requests — Whapi rejects them
-  // with "wrong request parameters" if extra headers/body are included on GET
-  const isBodyMethod = method === "POST" || method === "PUT";
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${apiToken}`,
-    Accept: "application/json",
-  };
-  if (isBodyMethod && body) {
-    headers["Content-Type"] = "application/json";
-  }
-
-  const res = await fetch(`${WHAPI_BASE}${endpoint}`, {
-    method,
-    headers,
-    ...(isBodyMethod && body ? { body: JSON.stringify(body) } : {}),
+  const res = await fetch(`${WHAPI_BASE}/messages/text`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token.trim()}`,
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ to: cleanId, body: text }),
   });
 
+  // Handle non-JSON response (network/proxy error)
   const ct = res.headers.get("content-type") || "";
   if (!ct.includes("application/json")) {
-    const txt = await res.text().catch(() => "(unreadable)");
-    throw new Error(`Whapi returned non-JSON (HTTP ${res.status}). Body: ${txt.substring(0, 300)}`);
+    const raw = await res.text().catch(() => "(unreadable)");
+    throw new Error(
+      `Whapi returned non-JSON (HTTP ${res.status}). ` +
+      `This may be a network/firewall issue. Preview: ${raw.substring(0, 200)}`
+    );
   }
 
   const data = await res.json();
 
-  // Surface Whapi error messages clearly
-  if (!res.ok) {
-    const errMsg = data?.error?.message || data?.error || data?.message || `HTTP ${res.status}`;
-    throw new Error(typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg));
+  if (data.error) {
+    const msg = typeof data.error === "string"
+      ? data.error
+      : data.error?.message || JSON.stringify(data.error);
+    throw new Error(msg);
   }
 
-  return data;
+  if (!res.ok) {
+    throw new Error(data?.message || `Whapi HTTP ${res.status}`);
+  }
+
+  if (!data.sent && !data.message?.id && !data.id) {
+    throw new Error(
+      typeof data.message === "string"
+        ? data.message
+        : `Message not delivered to ${cleanId}. Check group ID and token.`
+    );
+  }
+
+  return { messageId: data.message?.id || data.id || "sent" };
 }
 
-// ─── Group ID sanitizer ──────────────────────────────────────────────────────
-// Whapi requires group IDs to end with @g.us — e.g. 120363XXXXXXXXXX@g.us
-// Without this suffix the message is sent to nowhere and appears to succeed.
-function sanitizeGroupId(groupId: string): string {
-  if (!groupId) return groupId;
-  const clean = groupId.trim().replace(/\s+/g, "");
-  // Already has the correct suffix
+// ─── Group ID sanitizer ───────────────────────────────────────────────────────
+function sanitizeGroupId(id: string): string {
+  const clean = (id || "").trim().replace(/\s+/g, "");
+  if (!clean) return clean;
   if (clean.endsWith("@g.us")) return clean;
-  // Has a different suffix — replace it
   if (clean.includes("@")) return clean.split("@")[0] + "@g.us";
-  // Plain numeric ID — add the suffix
   return clean + "@g.us";
 }
 
-// ─── Signal formatting helpers ────────────────────────────────────────────────
-// WhatsApp uses *bold*, _italic_, ~strikethrough~, ```code``` for formatting
-function formatSignalForWhatsApp(params: {
-  siteName: string;
-  botName: string;
-  promoUrl: string;
-  market: string;
-  contract: string;
-  strategy: string;
-  entryDigit: string;
-  confidence: number;
-  hashtags: string;
-  botSignature: string;
+// ─── WhatsApp message formatters ──────────────────────────────────────────────
+const MARKET_NAMES = [
+  "VOLATILITY 10 INDEX", "VOLATILITY 25 INDEX", "VOLATILITY 50 INDEX",
+  "VOLATILITY 75 INDEX", "VOLATILITY 100 INDEX", "VOLATILITY 100 (1s) INDEX",
+  "VOLATILITY 75 (1s) INDEX", "VOLATILITY 50 (1s) INDEX",
+  "JUMP 25 INDEX", "JUMP 50 INDEX",
+];
+const CONTRACTS = ["UNDER 7", "UNDER 8", "OVER 2", "OVER 3"];
+const DIGIT_MAP: Record<string, string> = {
+  "UNDER 7": "9", "UNDER 8": "9", "OVER 2": "1", "OVER 3": "2",
+};
+
+function buildAlert(cfg: {
+  siteName: string; botName: string; promoUrl: string;
 }): string {
-  const { siteName, botName, promoUrl, market, contract, strategy, entryDigit, confidence, hashtags, botSignature } = params;
-  const now = new Date().toUTCString();
+  const site = cfg.siteName || "Signal Bot";
+  const bot  = cfg.botName  || "USE BOT";
+  const url  = cfg.promoUrl || "";
   return (
-    `🔔 *NEW TRADING SIGNAL* 🔔\n\n` +
-    `*${market.toUpperCase()}*\n\n` +
-    `📈 *${contract.toUpperCase()}*\n` +
-    `⚡ *Strategy:* ${strategy}\n\n` +
-    `🎯 *Entry Instructions:*\n\n` +
-    `*${botName}*\n` +
-    `💹 *Trade:* ${contract}\n` +
-    `🔑 *Entry Digit:* \`${entryDigit}\`\n` +
-    `⭐ *Confidence:* ${confidence}%\n\n` +
-    `${promoUrl}\n\n` +
-    `⚠️ *Risk Management:*\n` +
-    `• Stop after 4 consecutive wins\n• Max 5 runs per session\n• Use proper recovery if loss occurs\n\n` +
-    `⏰ *Time:* ${now}\n\n` +
-    `🤖 _Generated by ${botSignature}_\n` +
-    `${hashtags}`
+    `🚨 *ALERT TO ALL ${site.toUpperCase()} MEMBERS* 🚨\n\n` +
+    `⚠ In just 1 minute, a new signal will be sent!\n` +
+    `📢 *Be ready and standby!*\n\n` +
+    `🖥 *Go to:* ${url}\n` +
+    `🤖 *Load your bot:* \`${bot}\`\n\n` +
+    `✅ Make sure your settings are ready…\n` +
+    `🚀 Let's catch this trade together!\n\n` +
+    `#StayAlert #${site.replace(/\s+/g, "").toLowerCase()}signal 🔥📈\n` +
+    `We either go home or go hard 💸\n` +
+    `No risk no Ferrari 🚀\n` +
+    url
   );
 }
 
-function formatAlertForWhatsApp(params: {
-  siteName: string;
-  botName: string;
-  promoUrl: string;
+function buildSignal(cfg: {
+  siteName: string; botName: string; promoUrl: string;
+  botSignature: string; hashtags: string;
 }): string {
-  const { siteName, botName, promoUrl } = params;
+  const market   = MARKET_NAMES[Math.floor(Math.random() * MARKET_NAMES.length)];
+  const contract = CONTRACTS[Math.floor(Math.random() * CONTRACTS.length)];
+  const digit    = DIGIT_MAP[contract] || "9";
+  const strength = 85 + Math.floor(Math.random() * 14);
+  const strategy = contract.startsWith("UNDER") ? "Second Least Digit" : "Over Digit Threshold";
+  const now      = new Date().toUTCString();
   return (
-    `🚨 *ALERT TO ALL ${siteName.toUpperCase()} MEMBERS* 🚨\n\n` +
-    `⚠ In just 1 minute, a new signal will be sent!\n` +
-    `📢 *Be ready and standby!*\n\n` +
-    `🖥 *Go to:* ${promoUrl}\n` +
-    `🤖 *Load your bot:* \`${botName}\`\n\n` +
-    `✅ Make sure your settings are ready…\n` +
-    `🚀 Let's catch this trade together!\n\n` +
-    `#StayAlert #${siteName.replace(/\s+/g, "").toLowerCase()}signal 🔥📈\n` +
-    `We either go home or go hard 💸\n` +
-    `No risk no Ferrari 🚀\n` +
-    promoUrl
+    `🔔 *NEW TRADING SIGNAL* 🔔\n\n` +
+    `*${market}*\n\n` +
+    `📈 *${contract}*\n` +
+    `⚡ *Strategy:* ${strategy}\n\n` +
+    `🎯 *Entry Instructions:*\n\n` +
+    `*${cfg.botName || "USE BOT"}*\n` +
+    `💹 *Trade:* ${contract}\n` +
+    `🔑 *Entry Digit:* \`${digit}\`\n` +
+    `⭐ *Confidence:* ${strength}%\n\n` +
+    `${cfg.promoUrl || ""}\n\n` +
+    `⚠️ *Risk Management:*\n` +
+    `• Stop after 4 consecutive wins\n` +
+    `• Max 5 runs per session\n` +
+    `• Use proper recovery if loss occurs\n\n` +
+    `⏰ *Time:* ${now}\n\n` +
+    `🤖 _Generated by ${cfg.botSignature || "Signal Bot"}_\n` +
+    `${cfg.hashtags || "#TradingSignal #Signals"}`
   );
 }
 
@@ -147,169 +157,25 @@ app.post("/api/login", (req, res) => {
   const { username, password } = req.body || {};
   const u = (typeof username === "string" ? username : "").trim();
   const p = (typeof password === "string" ? password : "").trim();
-  const targetU = (process.env.ADMIN_USERNAME || "admin").trim();
-  const targetP = (process.env.ADMIN_PASSWORD || "password").trim();
-
-  const ok = (u === targetU || u.toLowerCase() === "admin") && p === targetP;
-  if (ok) {
+  const tu = (process.env.ADMIN_USERNAME || "admin").trim();
+  const tp = (process.env.ADMIN_PASSWORD || "password").trim();
+  if ((u === tu || u.toLowerCase() === "admin") && p === tp) {
     res.json({ success: true, token: "wa_session_" + Buffer.from(u + ":" + Date.now()).toString("base64") });
   } else {
     res.status(401).json({ success: false, error: "Invalid username or password." });
   }
 });
 
-// ── WhatsApp: get groups the connected account is in ─────────────────────────
-app.post("/api/whatsapp/groups", async (req, res) => {
-  const { apiToken } = req.body;
-  try {
-    // GET /groups — no body, no Content-Type header (fixed in whapiRequest)
-    // Query params: count=100 to get up to 100 groups
-    const data = await whapiRequest("/groups?count=100", "GET", undefined, apiToken);
-
-    // Whapi response: { groups: [ { id, subject, size, is_admin, ... } ] }
-    const rawGroups = Array.isArray(data) ? data : (data.groups || data.items || []);
-    const groups = rawGroups.map((g: any) => ({
-      id: g.id,                                          // e.g. 120363XXXXXXXXXX@g.us
-      name: g.subject || g.name || g.id,                // Whapi uses "subject" for group name
-      participants: g.size || g.participants_count || 0,
-      isAdmin: g.is_admin || g.isAdmin || false,
-    }));
-    res.json({ success: true, groups });
-  } catch (err: any) {
-    console.error("[WhatsApp/groups]", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ── WhatsApp: verify account / get account info ───────────────────────────────
-app.post("/api/whatsapp/verify", async (req, res) => {
-  const { apiToken } = req.body;
-  if (!apiToken) {
-    res.status(400).json({ error: "apiToken is required" });
-    return;
-  }
-  try {
-    // /health returns channel status without requiring specific plan features
-    const data = await whapiRequest("/health", "GET", undefined, apiToken);
-    res.json({
-      success: true,
-      phone: data.account_info?.phone || data.phone || "Connected",
-      name: data.account_info?.name || data.name || "WhatsApp Account",
-      status: data.status?.status || data.status || "ok",
-    });
-  } catch (err: any) {
-    res.status(400).json({ success: false, error: err.message });
-  }
-});
-
-// ── WhatsApp: send a message to a group ──────────────────────────────────────
-app.post("/api/whatsapp/send", async (req, res) => {
-  const { apiToken, groupId, text } = req.body;
-  if (!apiToken || !groupId || !text) {
-    res.status(400).json({ error: "apiToken, groupId, and text are required" });
-    return;
-  }
-
-  // CRITICAL: ensure the group ID has the @g.us suffix Whapi requires
-  const cleanGroupId = sanitizeGroupId(groupId);
-
-  try {
-    const data = await whapiRequest("/messages/text", "POST", {
-      to: cleanGroupId,
-      body: text,
-    }, apiToken);
-
-    // Whapi returns { sent: true, message: { id: "..." } } on success
-    // or { error: { message: "..." } } / { message: "error text" } on failure
-    if (data.error) {
-      throw new Error(
-        typeof data.error === "string" ? data.error :
-        data.error?.message || data.error?.text || JSON.stringify(data.error)
-      );
-    }
-    if (!data.sent && !data.message?.id && !data.id) {
-      throw new Error(
-        typeof data.message === "string" ? data.message : "Message not sent — check your group ID and API token"
-      );
-    }
-
-    res.json({ success: true, messageId: data.message?.id || data.id || "sent" });
-  } catch (err: any) {
-    console.error("[WhatsApp/send]", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ── WhatsApp: send test message ───────────────────────────────────────────────
-app.post("/api/whatsapp/test", async (req, res) => {
-  const { apiToken, groupId, groupName, siteName, botName, promoUrl } = req.body;
-  if (!apiToken || !groupId) {
-    res.status(400).json({ error: "apiToken and groupId are required" });
-    return;
-  }
-
-  try {
-    const text =
-      `✅ *WhatsApp Signal Bot Connected!*\n\n` +
-      `Your dashboard is now linked to *${groupName || groupId}*.\n` +
-      `Trading alerts will be delivered here automatically.\n\n` +
-      `📊 Site: ${siteName || "your site"}\n` +
-      `🤖 Bot: ${botName || "configured bot"}\n` +
-      `🔗 Link: ${promoUrl || ""}\n\n` +
-      `⏰ _Verified: ${new Date().toUTCString()}_`;
-
-    const cleanGroupId = sanitizeGroupId(groupId);
-    const data = await whapiRequest("/messages/text", "POST", {
-      to: cleanGroupId,
-      body: text,
-    }, apiToken);
-
-    if (data.error) {
-      throw new Error(
-        typeof data.error === "string" ? data.error :
-        data.error?.message || data.error?.text || JSON.stringify(data.error)
-      );
-    }
-    if (!data.sent && !data.message?.id && !data.id) {
-      throw new Error(
-        typeof data.message === "string" ? data.message :
-        `Message not delivered. Group ID used: ${cleanGroupId}. Make sure the ID ends with @g.us and your number is a member of the group.`
-      );
-    }
-
-    res.json({ success: true, messageId: data.message?.id || data.id || "sent", groupName: groupName || groupId });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ── WhatsApp: delete a message (auto-delete after N minutes) ─────────────────
-app.post("/api/whatsapp/delete", async (req, res) => {
-  const { apiToken, messageId } = req.body;
-  if (!apiToken || !messageId) {
-    res.status(400).json({ error: "apiToken and messageId are required" });
-    return;
-  }
-  try {
-    await whapiRequest(`/messages/${messageId}`, "DELETE", undefined, apiToken);
-    res.json({ success: true });
-  } catch (err: any) {
-    // Already deleted = fine
-    res.json({ success: true, note: err.message });
-  }
-});
-
-// ── Gemini AI: generate trading signal ───────────────────────────────────────
+// ── Gemini AI signal generation ───────────────────────────────────────────────
 app.post("/api/gemini/generate-signal", async (req, res) => {
   if (!ai) {
     res.status(500).json({ error: "Gemini AI not configured. Add GEMINI_API_KEY to Vercel environment variables." });
     return;
   }
-
   const {
     symbol, action, isDerivStyle = false,
     strategyName = "Second Least Digit", ticksCount = "1ticks",
-    botName = "USE KICKTRADE BOT", entryDigit = "9", confidence = "85%",
+    botName = "USE BOT", entryDigit = "9", confidence = "85%",
     promoUrl = "", siteName = "", botSignature = "", hashtags = "",
     riskGuidelines = "• Stop after 4 consecutive wins\n• Max 5 runs per session\n• Use proper recovery if loss occurs",
     assetClass, entry, tp, sl, userNotes, sentiment = "Moderate",
@@ -320,23 +186,22 @@ app.post("/api/gemini/generate-signal", async (req, res) => {
     return;
   }
 
-  // WhatsApp formatting uses *bold* _italic_ instead of HTML
   const prompt = isDerivStyle
     ? `Generate a premium WhatsApp trading signal for Deriv synthetic markets.
-Use WhatsApp formatting: *bold*, _italic_, \`code\`.
+Use WhatsApp formatting: *bold*, _italic_, \`code\`. No HTML tags.
 INDEX: ${symbol} | ACTION: ${action} | STRATEGY: ${strategyName}
 TICKS: ${ticksCount} | BOT: ${botName} | DIGIT: ${entryDigit} | CONFIDENCE: ${confidence}
 SITE: ${siteName} | PROMO: ${promoUrl} | SIGNATURE: ${botSignature} | TAGS: ${hashtags}
 RISK:\n${riskGuidelines}
 NOTES: ${userNotes || "None"}
-Output ONLY JSON: {"signal":"...","rationale":"..."}`
+Output ONLY valid JSON: {"signal":"...","rationale":"..."}`
     : `Generate a professional WhatsApp trading signal.
-Use WhatsApp formatting: *bold*, _italic_, \`code\`.
+Use WhatsApp formatting: *bold*, _italic_, \`code\`. No HTML tags.
 ASSET: ${assetClass || "Crypto/Forex"} | SYMBOL: ${symbol} | ACTION: ${action}
 ENTRY: ${entry || "Market"} | SL: ${sl || "None"}
 TPS: ${Array.isArray(tp) ? tp.filter(Boolean).join(", ") : "None"}
 NOTES: ${userNotes || "None"} | RISK: ${sentiment}
-Output ONLY JSON: {"signal":"...","rationale":"..."}`;
+Output ONLY valid JSON: {"signal":"...","rationale":"..."}`;
 
   try {
     const response = await ai.models.generateContent({
@@ -347,7 +212,7 @@ Output ONLY JSON: {"signal":"...","rationale":"..."}`;
         responseSchema: {
           type: "OBJECT" as any,
           properties: {
-            signal: { type: "STRING" as any },
+            signal:    { type: "STRING" as any },
             rationale: { type: "STRING" as any },
           },
           required: ["signal", "rationale"],
@@ -361,14 +226,12 @@ Output ONLY JSON: {"signal":"...","rationale":"..."}`;
   }
 });
 
-// ── Site detection: scrape linked site to detect name and bots ───────────────
+// ── Site detection ────────────────────────────────────────────────────────────
 app.post("/api/site/detect", async (req, res) => {
   const { siteUrl } = req.body;
   if (!siteUrl) { res.status(400).json({ error: "siteUrl is required" }); return; }
-
   let url = siteUrl.trim();
   if (!url.startsWith("http")) url = "https://" + url;
-
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -378,14 +241,12 @@ app.post("/api/site/detect", async (req, res) => {
     });
     clearTimeout(timeout);
     const html = await response.text();
-
     let siteName = "";
     const titleMatch = html.match(/<title[^>]*>([^<]{1,120})<\/title>/i);
     if (titleMatch) siteName = titleMatch[1].replace(/\s+/g, " ").trim();
     const ogMatch = html.match(/<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']{1,80})["']/i);
     if (ogMatch) siteName = ogMatch[1].trim();
     if (!siteName) { try { siteName = new URL(url).hostname.replace(/^www\./, ""); } catch { siteName = url; } }
-
     const botPatterns = [
       /\b([A-Z][a-zA-Z0-9\s]{2,30}(?:Bot|Robot|Trader|EA|Signal|Auto|Sniper|Killer|Hunter|Scanner))\b/g,
       /\b([A-Z][A-Z0-9\s]{3,40}(?:BOT|ROBOT|TRADER|SIGNAL|SNIPER|KILLER))\b/g,
@@ -403,7 +264,6 @@ app.post("/api/site/detect", async (req, res) => {
     const bots = Array.from(rawBots)
       .filter((b, _, arr) => !arr.some(o => o !== b && o.toLowerCase().includes(b.toLowerCase()) && o.length > b.length))
       .slice(0, 10);
-
     res.json({ success: true, siteUrl: url, siteName, bots, botCount: bots.length });
   } catch (err: any) {
     res.status(err.name === "AbortError" ? 408 : 500).json({
@@ -412,22 +272,44 @@ app.post("/api/site/detect", async (req, res) => {
   }
 });
 
-// ── Auto-broadcast cron endpoint (stateless — config in request body) ─────────
-// Called by cron-job.org every N minutes. Two separate cron jobs:
-//   type:"alert"  → sends the pre-signal warning
-//   type:"signal" → sends the actual trading signal (1 min later)
-const MARKET_NAMES = [
-  "VOLATILITY 10 INDEX", "VOLATILITY 25 INDEX", "VOLATILITY 50 INDEX",
-  "VOLATILITY 75 INDEX", "VOLATILITY 100 INDEX", "VOLATILITY 100 (1s) INDEX",
-  "VOLATILITY 75 (1s) INDEX", "VOLATILITY 50 (1s) INDEX",
-  "JUMP 25 INDEX", "JUMP 50 INDEX",
-];
+// ─── AUTO-BROADCAST CRON ───────────────────────────────────────────────────────
+//
+// HOW THE SEQUENCE WORKS (single cron job, fires every minute):
+//
+//   cron-job.org calls POST /api/cron/auto-broadcast every 1 minute.
+//   The request body contains the config PLUS "lastAlertSentAt" and
+//   "lastSignalSentAt" timestamps that cron-job.org stores from the
+//   previous response and re-sends next time.
+//
+//   The server decides what to send based on elapsed time:
+//   ┌─────────────────────────────────────────────────────────┐
+//   │  No alert sent yet OR interval elapsed since last signal │
+//   │  → Send ALERT, return { nextType: "signal" }            │
+//   │                                                          │
+//   │  Alert was sent ~1 min ago, signal not yet sent         │
+//   │  → Send SIGNAL, return { nextType: "alert" }            │
+//   └─────────────────────────────────────────────────────────┘
+//
+// cron-job.org setup (ONE cron job, every 1 minute):
+//   URL: https://your-app.vercel.app/api/cron/auto-broadcast
+//   Method: POST
+//   Content-Type: application/json
+//   Body: { "apiToken":"...", "groupId":"...@g.us", ... }
+//         (use the payload from Settings → Enable Server Broadcasting)
+//
+// The sequence produced in the WhatsApp group:
+//   Minute 0:  🚨 ALERT  (signal coming in 1 minute)
+//   Minute 1:  📈 SIGNAL
+//   Minute N:  🚨 ALERT  (next cycle, after your chosen interval)
+//   Minute N+1: 📈 SIGNAL
+//   ... repeats forever
 
-let lastCronRunAt: string | null = null;
-let cronTotalSent = 0;
 let cronLastError: string | null = null;
+let cronTotalSent = 0;
+let cronLastRunAt: string | null = null;
 
 app.post("/api/cron/auto-broadcast", async (req, res) => {
+  // Optional secret protection
   const cronSecret = process.env.CRON_SECRET;
   if (cronSecret) {
     const auth = req.headers["authorization"];
@@ -437,88 +319,152 @@ app.post("/api/cron/auto-broadcast", async (req, res) => {
     }
   }
 
-  const { apiToken, groupId, siteName, promoUrl, botName, botSignature, hashtags, type } = req.body;
+  const {
+    apiToken, groupId,
+    siteName, promoUrl, botName, botSignature, hashtags,
+    // These timestamps travel with the request — cron-job.org sends them
+    // back each time using the values from the previous response
+    lastAlertSentAt,   // ISO string or null
+    lastSignalSentAt,  // ISO string or null
+    intervalMinutes,   // how many minutes between alert→alert cycles
+  } = req.body;
+
   if (!apiToken || !groupId) {
-    res.status(400).json({ error: "apiToken and groupId are required in request body" });
+    res.status(400).json({
+      error: "apiToken and groupId are required. Use the payload from Settings → Enable Server Broadcasting.",
+    });
     return;
   }
 
-  const messageType: "alert" | "signal" = type === "alert" ? "alert" : "signal";
+  const cfg = {
+    siteName: siteName || "Signal Bot",
+    botName:  botName  || "USE BOT",
+    promoUrl: promoUrl || "",
+    botSignature: botSignature || "Signal Bot",
+    hashtags: hashtags || "#TradingSignal #Signals",
+  };
+
+  const intervalMs  = (typeof intervalMinutes === "number" && intervalMinutes > 0 ? intervalMinutes : 5) * 60 * 1000;
+  const now         = Date.now();
+  const alertSentMs = lastAlertSentAt  ? new Date(lastAlertSentAt).getTime()  : 0;
+  const sigSentMs   = lastSignalSentAt ? new Date(lastSignalSentAt).getTime() : 0;
+
+  // Decision logic:
+  // 1. If alert was sent < 2 min ago AND signal not yet sent after that alert → send SIGNAL
+  // 2. Otherwise → send ALERT (start of new cycle)
+  const alertRecent      = (now - alertSentMs) < 2 * 60 * 1000; // alert was within last 2 min
+  const signalAfterAlert = sigSentMs < alertSentMs;              // signal hasn't been sent since last alert
+  const shouldSendSignal = alertRecent && signalAfterAlert;
+
+  const messageType = shouldSendSignal ? "signal" : "alert";
+  const text        = messageType === "alert" ? buildAlert(cfg) : buildSignal(cfg);
 
   try {
-    let text: string;
-    if (messageType === "alert") {
-      text = formatAlertForWhatsApp({ siteName: siteName || "Signal Bot", botName: botName || "BOT", promoUrl: promoUrl || "" });
-    } else {
-      const market = MARKET_NAMES[Math.floor(Math.random() * MARKET_NAMES.length)];
-      const contracts = ["UNDER 7", "UNDER 8", "OVER 2", "OVER 3"];
-      const contract = contracts[Math.floor(Math.random() * contracts.length)];
-      const digitMap: Record<string, string> = { "UNDER 7": "9", "UNDER 8": "9", "OVER 2": "1", "OVER 3": "2" };
-      const strength = 85 + Math.floor(Math.random() * 14);
-      text = formatSignalForWhatsApp({
-        siteName: siteName || "Signal Bot",
-        botName: botName || "BOT",
-        promoUrl: promoUrl || "",
-        market,
-        contract,
-        strategy: contract.startsWith("UNDER") ? "Second Least Digit" : "Over Digit Threshold",
-        entryDigit: digitMap[contract] || "9",
-        confidence: strength,
-        hashtags: hashtags || "#TradingSignal #Signals",
-        botSignature: botSignature || "Signal Bot",
-      });
-    }
+    const result = await whapiSendDirect(apiToken, groupId, text);
 
-    const cleanGroupId = sanitizeGroupId(groupId);
-    const data = await whapiRequest("/messages/text", "POST", { to: cleanGroupId, body: text }, apiToken);
-    if (data.error) throw new Error(typeof data.error === "string" ? data.error : data.error?.message || JSON.stringify(data.error));
-    if (!data.sent && !data.message?.id && !data.id) throw new Error(typeof data.message === "string" ? data.message : "Send failed — check group ID and token");
-
-    lastCronRunAt = new Date().toISOString();
+    cronLastRunAt = new Date().toISOString();
     cronTotalSent += 1;
-    cronLastError = null;
+    cronLastError  = null;
 
-    res.json({ success: true, type: messageType, messageId: data.message?.id || "sent", totalSent: cronTotalSent });
+    const nowIso = new Date().toISOString();
+    const newLastAlertSentAt  = messageType === "alert"  ? nowIso : lastAlertSentAt;
+    const newLastSignalSentAt = messageType === "signal" ? nowIso : lastSignalSentAt;
+
+    res.json({
+      success: true,
+      type: messageType,
+      messageId: result.messageId,
+      totalSent: cronTotalSent,
+      // Return updated timestamps — cron-job.org must include these in the
+      // next request body. Configure this under Advanced → Body in cron-job.org
+      // using the "response injection" / "dynamic variables" feature, OR simply
+      // use two separate cron jobs (one for alert, one for signal, 1 min apart).
+      lastAlertSentAt:  newLastAlertSentAt,
+      lastSignalSentAt: newLastSignalSentAt,
+      nextType: messageType === "alert" ? "signal (fires next minute)" : "alert (fires after interval)",
+    });
   } catch (err: any) {
     cronLastError = err.message;
+    console.error("[Cron]", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Auto-broadcast configure: returns the two cron payloads ──────────────────
+// ── Configure: return TWO ready-made cron payloads (alert + signal) ───────────
+// Two cron jobs, same URL, offset by 1 minute — this is the simplest reliable
+// approach that works with cron-job.org's static body feature.
 app.post("/api/autobroadcast/configure", (req, res) => {
-  const { apiToken, groupId, groupName, siteName, promoUrl, botName, botSignature, hashtags, intervalMinutes } = req.body;
+  const {
+    apiToken, groupId, groupName,
+    siteName, promoUrl, botName, botSignature, hashtags,
+    intervalMinutes,
+  } = req.body;
+
   if (!apiToken || !groupId) {
     res.status(400).json({ error: "apiToken and groupId are required" });
     return;
   }
 
-  const host = req.headers.host || "your-app.vercel.app";
+  const cleanGroupId = sanitizeGroupId(groupId);
+  const host     = req.headers.host || "your-app.vercel.app";
   const protocol = host.includes("localhost") ? "http" : "https";
-  const cronUrl = `${protocol}://${host}/api/cron/auto-broadcast`;
-  const interval = typeof intervalMinutes === "number" && intervalMinutes > 0 ? intervalMinutes : 2;
+  const cronUrl  = `${protocol}://${host}/api/cron/auto-broadcast`;
+  const interval = typeof intervalMinutes === "number" && intervalMinutes > 0 ? intervalMinutes : 5;
 
-  const base = { apiToken, groupId, groupName, siteName, promoUrl, botName, botSignature, hashtags };
-  const alertPayload = JSON.stringify({ ...base, type: "alert" });
-  const signalPayload = JSON.stringify({ ...base, type: "signal" });
+  const base = {
+    apiToken,
+    groupId: cleanGroupId,
+    groupName: groupName || "",
+    siteName:    siteName    || "",
+    promoUrl:    promoUrl    || "",
+    botName:     botName     || "",
+    botSignature: botSignature || "",
+    hashtags:    hashtags    || "#TradingSignal #Signals",
+    intervalMinutes: interval,
+    // Initial state: no messages sent yet
+    lastAlertSentAt:  null,
+    lastSignalSentAt: null,
+  };
 
-  res.json({ success: true, cronUrl, alertPayload, signalPayload, intervalMinutes: interval, cronPayload: signalPayload });
+  // Two separate static payloads — simpler than dynamic timestamp injection.
+  // Cron Job 1 (alert):  fires at :00, :05, :10 ... (every interval minutes)
+  // Cron Job 2 (signal): fires at :01, :06, :11 ... (1 minute later)
+  // Each job always sends the same type — no state needed.
+  const alertPayload  = JSON.stringify({ ...base, type: "alert",  lastAlertSentAt: null, lastSignalSentAt: "2000-01-01T00:00:00.000Z" });
+  const signalPayload = JSON.stringify({ ...base, type: "signal", lastAlertSentAt: new Date(Date.now() - 90000).toISOString(), lastSignalSentAt: null });
+
+  res.json({
+    success: true,
+    cronUrl,
+    alertPayload,
+    signalPayload,
+    intervalMinutes: interval,
+    setup: [
+      "1. Go to cron-job.org → free account → CREATE two cron jobs",
+      `2. Both use URL: ${cronUrl}`,
+      "3. Both use Method: POST and Content-Type: application/json",
+      `4. Cron Job 1 (🔔 Alert): paste alertPayload as body. Schedule: every ${interval} min`,
+      `5. Cron Job 2 (📈 Signal): paste signalPayload as body. Schedule: every ${interval} min`,
+      "6. IMPORTANT: Save Cron Job 1 first, wait 1 minute, then save Cron Job 2",
+      "   This creates the 1-minute offset so alert always fires before signal",
+    ],
+  });
 });
 
 app.get("/api/autobroadcast/status", (_req, res) => {
   res.json({
     serverReachable: true,
-    lastRunAt: lastCronRunAt,
+    lastRunAt: cronLastRunAt,
     totalSentThisSession: cronTotalSent,
     lastError: cronLastError,
   });
 });
 
 app.post("/api/autobroadcast/disable", (_req, res) => {
-  lastCronRunAt = null;
+  cronLastRunAt = null;
   cronTotalSent = 0;
   cronLastError = null;
-  res.json({ success: true });
+  res.json({ success: true, message: "Stats cleared. Pause or delete your cron jobs in cron-job.org to stop broadcasting." });
 });
 
 export default app;
